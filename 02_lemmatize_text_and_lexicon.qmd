@@ -1,0 +1,435 @@
+---
+title: "Subreddit Diet Pipeline — 2. Lemmatize"
+subtitle: "udpipe lemmatization of subreddit text and the diet/nutrition word list"
+author: "Peter Kerkhof"
+date: last-modified
+format:
+  html: default
+  pdf: default
+  docx: default
+editor: visual
+execute:
+  echo: false
+  warning: false
+editor_options:
+  chunk_output_type: inline
+always_allow_html: yes
+---
+
+## 1. Setup and data loading
+
+```{r}
+#| message: false
+#| label: setup-environment
+
+rm(list = ls()[!sapply(ls(), function(x) is.function(get(x)))])
+cat("\014")
+options(scipen = 999)
+
+# Keep non-ASCII characters (>=, em-dash) intact in figures and printed output.
+# Running from a bare terminal can start R in a non-UTF-8 locale, which silently
+# turns them into "<U+2265>" in plot labels and console output. RStudio already
+# sets a UTF-8 locale, so this is only a safety net for terminal/CI runs.
+if (!isTRUE(l10n_info()[["UTF-8"]])) {
+  invisible(suppressWarnings(Sys.setlocale("LC_CTYPE", "en_US.UTF-8")))
+}
+
+library(tidyverse)
+library(here)
+library(arrow)   # not the old "feather" package too: both define read_feather/write_feather,
+                 # so whichever loads last silently wins. arrow replaces it and reads
+                 # both the old and new file formats.
+library(udpipe)
+library(tidytext)
+library(stringi)
+
+source(here("config.R"))
+```
+
+```{r}
+#| message: false
+#| label: load-data
+
+# Subreddit import (output of script 01). All four dedicated subreddits, no cleaning.
+
+df <- arrow::read_feather(
+  file.path(DATA_PATH, "data/myo_dys_subreddits_2005_jul2026.feather")
+)
+
+cat("Loaded", scales::comma(nrow(df)), "subreddit posts\n")
+print(df |> count(subreddit, disease_type, sort = TRUE))
+```
+
+## 2. Load udpipe model
+
+```{r}
+#| message: false
+#| label: load-udpipe-model
+
+model_dir <- file.path(DATA_PATH, "udpipe")
+if (!dir.exists(model_dir)) dir.create(model_dir, recursive = TRUE)
+model_path <- file.path(model_dir, "english-ewt-ud-2.5-191206.udpipe")
+
+if (file.exists(model_path)) {
+  ud_model <- udpipe_load_model(file = model_path)
+  cat("Loaded existing udpipe model from:", model_path, "\n")
+} else {
+  download_info <- udpipe_download_model(language = "english-ewt", model_dir = model_dir)
+  model_path <- download_info$file_model
+  if (!file.exists(model_path)) stop("Failed to download the English udpipe model.")
+  ud_model <- udpipe_load_model(file = model_path)
+  cat("Downloaded and loaded udpipe model to:", model_path, "\n")
+}
+```
+
+## 3. Normalization rules
+
+```{r}
+#| message: false
+#| label: define-term-normalization
+
+# ---------------------------------------------------------------------------
+# Tidying up the words before we count them.
+#
+# Some background. The software (udpipe) reduces every word to its dictionary form,
+# so that "eating", "ate" and "eats" all become "eat" and we can count them together.
+# That dictionary form is called the LEMMA; the word as actually typed is the TOKEN.
+# udpipe gets this right most of the time, but not always — especially for medical
+# words it has never seen. So we add four sets of corrections:
+#
+#   token_lemma_overrides  fixes words udpipe reduces wrongly (matches what was typed)
+#   lemma_fixes            fixes wrong dictionary forms it produces (matches the result)
+#   clean_diet_terms()     groups spelling/wording variants of the same diet term
+#   compound_map           glues two-word terms ("fish oil") into one
+#
+# All of it is applied to the posts (section 4) AND to our diet word list (section 6),
+# so that both sides end up in the same shape and can actually be matched up.
+# ---------------------------------------------------------------------------
+
+# Words udpipe mangles. It turns "myositis" into "tmyositis" now and then, and leaves
+# "joints" as a plural instead of reducing it to "joint". Here we just tell it the
+# answer. This list matches on the word AS TYPED, which is why it's separate from the
+# lists below (they match on udpipe's output). It applies to the posts only — a word
+# list has no "as typed" version to match against.
+# These are disease words, not diet words, so this doesn't change any of the diet
+# counts; it just keeps the cleaned-up text honest.
+token_lemma_overrides <- c(
+  "joint" = "joint", "joints" = "joint",
+  "flare" = "flare", "flares" = "flare",
+  "ra" = "ra", "ccp" = "ccp", "rf" = "rf",
+  "myositis" = "myositis", "neuropathy" = "neuropathy"
+)
+
+# The other kind of udpipe slip: the dictionary form it lands on is simply wrong.
+# It reduces "calories" to "calory" (not a word), and invents "jous" for "joint".
+# This list matches on udpipe's OUTPUT, so it works for the posts and the word list.
+lemma_fixes <- c("jous" = "joint", "calory" = "calorie")
+
+# Different ways of saying the same thing, collapsed into one term so they're counted
+# together: eating/ate/eats -> eat, carbs -> carb, dietitian/dietician -> dietician.
+# Only about wording variants — udpipe's mistakes are handled by the two lists above.
+clean_diet_terms <- function(v) {
+  case_when(
+    v %in% c("ate", "eaten", "eating", "eats") ~ "eat",
+    v %in% c("fed", "feeding", "feeds") ~ "feed",
+    v %in% c("drank", "drinking", "drinks") ~ "drink",
+    v %in% c("cooked", "cooking", "cooks") ~ "cook",
+    v %in% c("consumed", "consuming", "consumes", "consumption") ~ "consume",
+    v %in% c("snacked", "snacking", "snacks") ~ "snack",
+    v %in% c("fasted", "fasting") ~ "fast",
+    v %in% c("dieting", "diets", "dietary", "dieted") ~ "diet",
+    v %in% c("dietician", "dieticians", "dietitian", "dietitians") ~ "dietician",
+    v %in% c("alcoholic", "alcoholism", "alcoholics") ~ "alcohol",
+    v == "nondrinker" ~ "nondrinker",
+    v == "drinker" ~ "drinker",
+    v %in% c("nutritional", "nutritionally", "nutritious") ~ "nutrition",
+    v %in% c("nutrients") ~ "nutrient",
+    v %in% c("fats", "fatty") ~ "fat",
+    v %in% c("vitamins", "vitamine") ~ "vitamin",
+    v %in% c("multivitamins") ~ "multivitamin",
+    v %in% c("proteins", "proteinaceous") ~ "protein",
+    v %in% c("carbohydrates") ~ "carbohydrate",
+    v %in% c("carbs") ~ "carb",
+    v %in% c("antioxidants") ~ "antioxidant",
+    v %in% c("probiotics") ~ "probiotic",
+    v %in% c("prebiotics") ~ "prebiotic",
+    v %in% c("postbiotics") ~ "postbiotic",
+    v %in% c("synbiotics") ~ "synbiotic",
+    v %in% c("polyphenols") ~ "polyphenol",
+    v %in% c("isoflavones") ~ "isoflavone",
+    v %in% c("macronutrients") ~ "macronutrient",
+    v %in% c("micronutrients") ~ "micronutrient",
+    v %in% c("minerals") ~ "mineral",
+    v %in% c("sugars") ~ "sugar",
+    v %in% c("foods") ~ "food",
+    v %in% c("meals") ~ "meal",
+    v %in% c("ingredients") ~ "ingredient",
+    v %in% c("fruits") ~ "fruit",
+    v %in% c("vegetables") ~ "vegetable",
+    v %in% c("berries") ~ "berry",
+    v %in% c("blueberries") ~ "blueberry",
+    v %in% c("raspberries") ~ "raspberry",
+    v %in% c("elderberries") ~ "elderberry",
+    v %in% c("grapes") ~ "grape",
+    v %in% c("legumes") ~ "legume",
+    v %in% c("nuts") ~ "nut",
+    v %in% c("seeds") ~ "seed",
+    v %in% c("mushrooms") ~ "mushroom",
+    v %in% c("oysters") ~ "oyster",
+    v %in% c("herbs", "herbal") ~ "herb",
+    v %in% c("spices") ~ "spice",
+    v %in% c("oils") ~ "oil",
+    v %in% c("fibers") ~ "fiber",
+    v %in% c("juices") ~ "juice",
+    v %in% c("plants") ~ "plant",
+    v %in% c("aminos") ~ "amino",
+    v %in% c("bcaas") ~ "bcaa",
+    v %in% c("lipoproteins") ~ "lipoprotein",
+    v %in% c("ketosis", "keto-friendly") ~ "keto",
+    v %in% c("vegans") ~ "vegan",
+    v %in% c("vegetarians") ~ "vegetarian",
+    TRUE ~ v
+  )
+}
+
+# Terms that are two words but one idea. We count words one at a time, so "fish oil"
+# would otherwise be counted as "fish" plus "oil" — losing the fact that it's a
+# supplement. Gluing them into "fishoil" keeps them together. These go into the text
+# (section 5) AND the word list (section 6), so both sides agree.
+compound_map <- c(
+  "fish oil" = "fishoil", "red yeast rice" = "redyeastrice", "junk food" = "junkfood",
+  "green tea" = "greentea", "black tea" = "blacktea", "dark chocolate" = "darkchocolate",
+  "amino acid" = "aminoacid", "folic acid" = "folicacid", "fatty acid" = "fattyacid",
+  "meal plan" = "mealplan", "whole food" = "wholefood", "pea protein" = "peaprotein",
+  "soy protein" = "soyprotein", "protein supplement" = "proteinsupplement",
+  "oyster mushroom" = "oystermushroom", "citrus fruit" = "citrusfruit"
+)
+# The same trick, but for the opposite reason. "Creatine kinase" is a blood test, not
+# the supplement creatine — yet it starts with the word creatine, so it would be
+# counted as one. Same for "immune system" and "immune". We glue these together too,
+# but then deliberately leave them OUT of the word list. The glued word matches
+# nothing, so these mentions quietly drop out of the diet counts, which is what we
+# want. (Keep this list separate from the one above: if you merge them, the blood test
+# gets added to the diet lexicon and starts counting as food.)
+noncount_merges <- c("creatine kinase" = "creatinekinase", "immune system" = "immunesystem")
+
+# Turn both lists into search patterns for section 5. The \\b marks a word boundary,
+# so "fish oil" is only replaced when it stands as its own words, not inside a longer
+# one. The text is already lowercase by this point, so we don't worry about capitals.
+compound_pat <- local({
+  all_merges <- c(compound_map, noncount_merges)
+  setNames(all_merges, paste0("\\b", names(all_merges), "\\b"))
+})
+
+# Words that mean something else entirely in a muscle-disease forum.
+#
+# This is the big one. Several perfectly good diet words are also clinical words, and
+# in these subreddits they usually aren't about food at all:
+#   "fiber"   -> almost always "small fiber neuropathy" or "muscle fiber"
+#   "fat"     -> "fatty infiltration" on an MRI report
+#   "sodium"  -> "sodium channel"
+#   "calcium" -> "calcium deposits" (calcinosis)
+#   "salt"    -> "take it with a grain of salt", or an Epsom salt bath
+# Counting those as dietary would inflate the results and, worse, could invent a
+# finding that isn't there.
+#
+# So each rule below removes the word ONLY when it sits next to one of these
+# give-away neighbours, and leaves it alone otherwise — someone genuinely talking
+# about fibre in their diet still gets counted. Runs on the cleaned-up text, after
+# the steps above.
+#
+# Adding a new rule? Run check_diet_term_context.R first: it shows you which words
+# actually sit either side of a term in the real posts, so you can see what you'd be
+# removing instead of guessing.
+disambiguate_diet_terms <- function(txt) {
+  txt |>
+    # fiber: muscle/nerve fibre, single-fibre EMG, small-fibre neuropathy, fibre types
+    str_replace_all(regex("\\b(small|single|muscle|nerve|carbon|motor|sensory|atrophic|twitch|type|ii|iia|iib)\\s+fiber\\b", ignore_case = TRUE), "\\1") |>
+    str_replace_all(regex("\\bfiber\\s+(neuropathy|emg|polyneuropathy|biopsy|density|type|typing)\\b", ignore_case = TRUE), "\\1") |>
+    # fat: fatty infiltration / fat deposits / fat replacement (MRI + atrophy language)
+    str_replace_all(regex("\\bfat\\s+(infiltration|infiltrate|deposit|deposits|tissue|replacement|cell|cells|pad)\\b", ignore_case = TRUE), "\\1") |>
+    str_replace_all(regex("\\b(edema|atrophy|fibrous|replace)\\s+fat\\b", ignore_case = TRUE), "\\1") |>
+    # calcium: calcinosis (calcium deposits) and calcium-channel
+    str_replace_all(regex("\\bcalcium\\s+(deposit|deposits|channel|channels|dysregulation)\\b", ignore_case = TRUE), "\\1") |>
+    # sodium/potassium channel(opathy): muscle channelopathies, not dietary intake
+    str_replace_all(regex("\\b(sodium|potassium)\\s+(channel|channels|channelopathy|channelopathies)\\b", ignore_case = TRUE), "\\2") |>
+    # oil: non-food oils (fish/olive/coconut oil are handled/kept as dietary)
+    str_replace_all(regex("\\b(snake|cbd|cb|essential|castor|cannabis|lavender|oregano)\\s+oil\\b", ignore_case = TRUE), "\\1") |>
+    # sugar: blood sugar (glycaemia) and the "sugar-coat" idiom
+    str_replace_all(regex("\\bblood\\s+sugar\\b", ignore_case = TRUE), "blood") |>
+    str_replace_all(regex("\\bsugar\\s+coat\\b", ignore_case = TRUE), "coat") |>
+    # salt: "grain of salt" idiom, epsom/bath salt (topical, not dietary)
+    str_replace_all(regex("\\b(epsom|bath|grain)\\s+salt\\b", ignore_case = TRUE), "\\1") |>
+    str_replace_all(regex("\\bsalt\\s+bath\\b", ignore_case = TRUE), "bath") |>
+    str_squish()
+}
+```
+
+## 4. Lemmatize post text with udpipe
+
+```{r}
+#| message: false
+#| label: lemmatize-text
+
+# Tidy the raw text first: strip web links, standardise odd characters (people paste
+# from all sorts of places), remove invisible formatting characters, and squash runs
+# of spaces. Nothing here changes the words themselves.
+df$text_clean <- df$text |>
+  str_replace_all("https?://\\S+|www\\.\\S+", " ") |>
+  stri_trans_general("NFKC") |>
+  str_replace_all("\\p{Cf}", " ") |>
+  str_squish()
+
+if (!"doc_id" %in% names(df)) df$doc_id <- as.character(seq_len(nrow(df)))
+
+cat("Annotating", scales::comma(nrow(df)), "posts with udpipe...\n")
+# This is the slow step — it reads every post word by word, so it takes minutes rather
+# than seconds. We spread the work over several processor cores to speed it up
+# (NUM_THREADS comes from config.R). The result is exactly the same either way; only
+# the waiting time changes.
+x <- udpipe_annotate(ud_model, x = df$text_clean, doc_id = df$doc_id,
+                     parallel.cores = if (exists("NUM_THREADS")) NUM_THREADS else 1L)
+x_df <- as.data.frame(x) |>
+  # Insurance: make sure "feedback" stays "feedback". The current model handles it
+  # fine, but a future version might split it into "feed" + "back", which would land
+  # "feed" in our diet counts.
+  mutate(lemma = ifelse(tolower(token) == "feedback", "feedback", lemma))
+cat("Annotation complete:", scales::comma(nrow(x_df)), "tokens\n")
+```
+
+```{r}
+#| message: false
+#| label: postprocess-lemmas
+
+# We only keep "content words" — the ones carrying actual meaning. udpipe labels every
+# word with its part of speech, so we keep nouns, names, adjectives and verbs, and
+# drop the connective tissue (the, and, is, of...) that says nothing about diet.
+content_upos <- c("NOUN", "PROPN", "ADJ", "VERB")
+
+# Turn udpipe's word-by-word output into one cleaned-up line of text per post.
+# The order of these steps matters, so in plain terms:
+#  1. If udpipe returned a strange dictionary form, fall back to the word as typed.
+#  2. Same if the form contains anything other than letters (stray symbols, digits).
+#  3. Apply our fixes for words it reduces wrongly (section 3).
+#  4. Keep only the content words (see above).
+#  5. Drop everyday filler words ("the", "and"). We make an exception for the noun
+#     "back", which is filler in English but a body part here.
+#  6. Drop contractions the software leaves behind ("ive", "dont").
+#  7. Apply our fixes for wrong dictionary forms (calory -> calorie).
+#  8. Finally, group the wording variants of each diet term together.
+lemmas_filtered <- x_df |>
+  transmute(doc_id, token = tolower(token), lemma = tolower(lemma), upos) |>
+  mutate(
+    bad_tag = (!upos %in% content_upos) & grepl("^[a-z][a-z'-]{3,}$", token),
+    lemma = if_else(bad_tag, token, lemma)
+  ) |>
+  mutate(lemma = if_else(!grepl("^[a-z][a-z'-]*$", lemma), token, lemma)) |>
+  mutate(lemma = if_else(token %in% names(token_lemma_overrides),
+                         token_lemma_overrides[token], lemma)) |>
+  filter(upos %in% content_upos) |>
+  filter((lemma == "back" & upos == "NOUN") | !(lemma %in% stop_words$word)) |>
+  filter(!(lemma %in% c("ive", "im", "dont", "cant", "wont"))) |>
+  mutate(lemma = coalesce(lemma_fixes[lemma], lemma)) |>
+  mutate(lemma = clean_diet_terms(lemma))
+
+lemmatized_text_df <- lemmas_filtered |>
+  group_by(doc_id) |>
+  summarise(lemmatized_text = paste(lemma, collapse = " "), .groups = "drop")
+
+df <- df |> left_join(lemmatized_text_df, by = "doc_id")
+cat("Lemmatized text created for", scales::comma(nrow(df)), "posts\n")
+```
+
+## 5. Compound term merging
+
+```{r}
+#| message: false
+#| label: compound-term-merging
+
+# Merge multi-word terms into single tokens using the shared compound_map (section 3).
+df <- df |>
+  mutate(lemmatized_text = lemmatized_text |>
+    str_remove_all("\\d+") |>
+    str_replace_all(compound_pat) |>
+    str_squish())
+
+cat("Compound term merging complete\n")
+```
+
+```{r}
+#| message: false
+#| label: disambiguate-polysemous-terms
+
+# Remove the clinical uses of words like fiber, fat, calcium and salt, so they aren't
+# counted as food. See disambiguate_diet_terms() in section 3 for what each rule does.
+df <- df |> mutate(lemmatized_text = disambiguate_diet_terms(lemmatized_text))
+
+cat("Polysemous-term disambiguation complete\n")
+```
+
+## 6. Lemmatize the diet word list
+
+```{r}
+#| message: false
+#| label: lemmatize-word-list
+
+single_diet_terms <- readRDS(file.path(DATA_PATH, "word_lists/single_diet_terms.RDS"))
+cat("Loaded", length(single_diet_terms), "single diet terms\n")
+
+diet_terms_annotated <- udpipe_annotate(ud_model, x = single_diet_terms) |>
+  as.data.frame() |>
+  mutate(token = tolower(token), lemma = tolower(lemma))
+
+# The word list has to go through the same mill as the posts, otherwise the two won't
+# line up: if the posts say "calorie" and the list still says "calories", they never
+# match. So we apply the same fixes and the same grouping here.
+# (token_lemma_overrides is skipped — it matches words as typed in a sentence, and a
+# word list has no sentences. None of its words are diet terms anyway.)
+diet_terms_lemmatized <- diet_terms_annotated |>
+  mutate(lemma = coalesce(lemma_fixes[lemma], lemma)) |>
+  mutate(lemma = clean_diet_terms(lemma)) |>
+  distinct(lemma) |>
+  rename(word = lemma)
+
+# Add the single-token forms of the compound terms (shared compound_map, section 3).
+compound_terms <- tibble(word = unname(compound_map))
+
+diet_terms_lemmatized <- bind_rows(diet_terms_lemmatized, compound_terms) |>
+  distinct()
+
+# Junk to throw out of the word list.
+# udpipe is guessing here: it's reading our terms as a bare list, with no sentence
+# around them to give a clue, so it slips more than usual. What comes out:
+#   "-", "10", "3", "6"   leftovers from terms like "omega-3" being split up
+#   "die", "processe", "see"   bad guesses at "dieting", "processed" and "seed"
+#   "coq", "dash"   fragments of "CoQ10" and the DASH diet — too vague to match on
+#                   ("dash" would catch every "a dash of salt")
+# Note we only bin these from the LIST. We leave the posts alone, because there
+# "die" and "see" are usually the ordinary verbs, and we don't want to touch those.
+terms_to_remove <- c("-", "10", "3", "6", "die", "see", "processe", "coq", "dash")
+diet_terms_lemmatized <- diet_terms_lemmatized |>
+  filter(!word %in% terms_to_remove)
+
+cat("Final lemmatized word list:", nrow(diet_terms_lemmatized), "unique terms\n")
+```
+
+## 7. Save outputs
+
+```{r}
+#| message: false
+#| label: save-outputs
+
+output_path <- file.path(DATA_PATH, "data/myo_dys_subreddits_lemmatized_2005_jul2026.feather")
+write_feather(df, output_path)
+cat("Saved lemmatized subreddit data to:", output_path, "(", scales::comma(nrow(df)), "rows )\n")
+
+# Word list is identical to the full-pipeline one; save under the shared name so
+# downstream scripts can read either pipeline's output.
+wordlist_path <- file.path(DATA_PATH, "word_lists/diet_terms_lemmatized.RDS")
+saveRDS(diet_terms_lemmatized, wordlist_path)
+cat("Saved lemmatized word list to:", wordlist_path, "(", nrow(diet_terms_lemmatized), "terms )\n")
+
+udpipe_path <- file.path(DATA_PATH, "data/myo_dys_subreddits_udpipe_annotations.feather")
+write_feather(x_df, udpipe_path)
+cat("Saved udpipe annotations to:", udpipe_path, "\n")
+```

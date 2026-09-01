@@ -1,0 +1,498 @@
+---
+title: "Subreddit Diet Pipeline — 5. Semantic Network Analysis"
+subtitle: "Diet-term co-occurrence network, community detection, and disease-association permutation test"
+author: "Peter Kerkhof"
+date: last-modified
+format:
+  html: default
+  pdf: default
+  docx: default
+editor: visual
+execute:
+  echo: false
+  warning: false
+editor_options:
+  chunk_output_type: inline
+always_allow_html: yes
+---
+
+> **Scope.** This step describes how diet topics cluster relative to one another, and tests whether those clusters differ by disease group. It is **descriptive, not confirmatory**: the community structure is sensitive to the edge/node thresholds and to Louvain's stochasticity, so the manuscript rests the *disease contrast* on the per-term comparison in script 04 and uses the network to show how the vocabulary is organized. The permutation test reported here finds no difference in disease composition across communities, which is itself the reported result. This script reproduces the focal set from script 03's output and builds the network on it, so it runs independently of script 04.
+
+## 1. Setup
+
+```{r}
+#| message: false
+#| label: setup-environment
+
+rm(list = ls()[!sapply(ls(), function(x) is.function(get(x)))])
+cat("\014")
+options(scipen = 999)
+
+# Keep non-ASCII characters (>=, em-dash) intact in figures and printed output.
+# Running from a bare terminal can start R in a non-UTF-8 locale, which silently
+# turns them into "<U+2265>" in plot labels and console output. RStudio already
+# sets a UTF-8 locale, so this is only a safety net for terminal/CI runs.
+if (!isTRUE(l10n_info()[["UTF-8"]])) {
+  invisible(suppressWarnings(Sys.setlocale("LC_CTYPE", "en_US.UTF-8")))
+}
+
+library(tidyverse)
+library(here)
+library(tidytext)
+library(tidygraph)
+library(ggraph)
+library(igraph)
+library(knitr)
+
+source(here("config.R"))
+
+fig_dir <- file.path(DATA_PATH, "figures")
+dir.create(fig_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Colors: teal = Myositis, red = Muscular Dystrophy
+disease_colors <- c("Muscular Dystrophy" = "#F8766D", "Myositis" = "#00BFC4")
+
+theme_diet <- theme_minimal(base_size = 12) +
+  theme(
+    plot.title.position = "plot",
+    plot.margin = margin(10, 10, 10, 10),
+    plot.caption = element_text(size = 9, color = "grey40", hjust = 0)
+  )
+
+theme_diet_network <- theme_diet +
+  theme(
+    axis.text = element_blank(),
+    axis.title = element_blank(),
+    axis.ticks = element_blank(),
+    legend.position = "right",
+    legend.box = "vertical"
+  )
+```
+
+## 2. Load diet posts and word list
+
+```{r}
+#| message: false
+#| label: load-data
+
+# Diet posts from the four dedicated subreddits (output of script 03).
+# Already carries lemmatized_text, disease_type, and centrality scores.
+df_diet <- arrow::read_feather(
+  file.path(DATA_PATH, "data/myo_dys_subreddits_diet_posts_2005_jul2026.feather")
+)
+
+diet_terms_lemmatized <- readRDS(
+  file.path(DATA_PATH, "word_lists/diet_terms_lemmatized.RDS")
+)
+
+cat("Diet posts:", scales::comma(nrow(df_diet)), "\n")
+print(df_diet |> count(disease_type))
+cat("Diet word list:", nrow(diet_terms_lemmatized), "terms\n")
+```
+
+## 3. Tokenize and define the focal set
+
+```{r}
+#| message: false
+#| label: tokenize
+
+tokens <- df_diet |>
+  select(doc_id, text = lemmatized_text) |>
+  filter(!is.na(text)) |>
+  unnest_tokens(word, text)
+
+cat("Total tokens:", scales::comma(nrow(tokens)), "\n")
+```
+
+```{r}
+#| label: define-focal-set
+#| message: false
+
+# The network is built on the focal set: diet posts with above-average
+# length-adjusted diet centrality (positive residual). This matches the
+# sensitivity set used in script 04.
+top_diet_docs <- df_diet |> filter(diet_centrality_adj > 0)
+n_top <- nrow(top_diet_docs)
+
+cat("Focal set — above-average diet centrality:", n_top, "\n")
+print(table(top_diet_docs$disease_type))
+```
+
+## 4. Prepare semantic network
+
+```{r}
+#| label: prepare-network
+#| message: false
+
+# Generic, low-content diet words that name no specific item.
+custom_stop_words <- tibble(word = c("eat", "food", "drink", "feed", "nutrition",
+                                     "consume", "ingredient"))
+
+# Additional generic process/container words dropped from the network. They
+# stay in the diet lexicon for post SELECTION (script 03) and in the per-term
+# comparison in script 04 — a post about "meals"/"cooking" is still a diet post
+# — but as network NODES they are low-content ("cook"/"meal" formed a junk
+# {meal, cook} cluster without adding semantic structure). Kept: "snack"/"sugar"
+# (contentful food terms), "herb" (herbal foods/supplements).
+network_stop_words <- bind_rows(custom_stop_words, tibble(word = c("cook", "meal")))
+
+tokens_filtered <- tokens |>
+  semi_join(top_diet_docs |> select(doc_id), by = "doc_id") |>
+  anti_join(network_stop_words, by = "word") |>
+  filter(str_length(word) > 2, !str_detect(word, "^[0-9]+$"))
+
+# What counts as "normal" here. The muscular dystrophy side is much bigger, so a term
+# would land in MD posts ~80% of the time purely by chance. We work that baseline out
+# below and colour the network against it, so a term only looks MD-ish if it beats
+# what the corpus size alone would predict.
+doc_term_pairs <- tokens_filtered |>
+  distinct(doc_id, word) |>
+  left_join(top_diet_docs |> select(doc_id, disease_type), by = "doc_id")
+md_proportion <- mean(doc_term_pairs$disease_type == "Muscular Dystrophy")
+cat("MD document-term pair proportion (gradient midpoint):",
+    scales::percent(md_proportion, accuracy = 0.1), "\n")
+
+# How many posts each term appears in.
+term_doc_freq <- tokens_filtered |> distinct(doc_id, word) |> count(word, name = "df")
+
+# Now the network itself. The idea: two diet terms are "connected" if people tend to
+# mention them in the same post. Count how often every pair turns up together...
+pairs <- tokens_filtered |>
+  distinct(doc_id, word) |>
+  widyr::pairwise_count(word, doc_id, sort = TRUE, upper = FALSE)
+
+# ...but a raw count is unfair to rarer words. "Protein" appears everywhere, so it
+# co-occurs with everything simply because it's common — that's not a real link.
+# So we score each pair by how often they appear TOGETHER as a share of the posts
+# where EITHER appears (a Jaccard score). Two terms mentioned only with each other
+# score high even if both are rare; a common word riding along with everything
+# scores low. That share becomes the strength of the connection.
+pairs_jaccard <- pairs |>
+  left_join(term_doc_freq, by = c("item1" = "word")) |> rename(df1 = df) |>
+  left_join(term_doc_freq, by = c("item2" = "word")) |> rename(df2 = df) |>
+  mutate(jaccard = n / (df1 + df2 - n))
+
+cat("Pairwise co-occurrence calculated:", scales::comma(nrow(pairs_jaccard)), "pairs\n")
+```
+
+```{r}
+#| label: shared-network-objects
+#| message: false
+
+diet_terms <- diet_terms_lemmatized$word
+
+term_disease_association <- tokens_filtered |>
+  distinct(doc_id, word) |>
+  left_join(top_diet_docs |> select(doc_id, disease_type), by = "doc_id") |>
+  count(word, disease_type) |>
+  pivot_wider(names_from = disease_type, values_from = n, values_fill = 0L) |>
+  mutate(md_association = `Muscular Dystrophy` / (`Muscular Dystrophy` + Myositis)) |>
+  select(name = word, md_association)
+```
+
+## 5. Diet-only semantic network
+
+```{r}
+#| label: build-diet-only-network
+#| message: false
+
+md_proportion_diet_init <- tokens_filtered |>
+  filter(word %in% diet_terms) |>
+  distinct(doc_id, word) |>
+  left_join(top_diet_docs |> select(doc_id, disease_type), by = "doc_id") |>
+  pull(disease_type) |>
+  (\(x) mean(x == "Muscular Dystrophy"))()
+
+# We only keep links that are actually meaningful, and drop terms that are too rare to
+# say anything about or so common they attach to everything.
+#
+#   min_jaccard_diet    how strong a connection has to be before we draw it. Raise it
+#                       and you get fewer, cleaner groups; lower it and more terms
+#                       appear but the groups blur into each other.
+#   min_node_n_diet     a term must show up in at least this many posts to be included
+#   max_node_n_diet     ...and no more than this — a word in nearly every post tells
+#                       us nothing about who talks about what
+#   label_min_n_diet    only print labels for the busier terms, so the figure stays
+#                       readable (the smaller dots are still in the network)
+#   degree_filter_diet  drop any term left with no connections at all
+#
+# These are judgement calls, not settings with a right answer. Worth re-checking the
+# figure if you change them.
+min_jaccard_diet   <- 0.09
+min_node_n_diet    <- 5
+max_node_n_diet    <- 350
+label_min_n_diet   <- 7
+degree_filter_diet <- 1
+
+diet_only_edges <- pairs_jaccard |>
+  filter(item1 %in% diet_terms & item2 %in% diet_terms) |>
+  filter(jaccard >= min_jaccard_diet) |>
+  transmute(from = item1, to = item2, weight = jaccard)
+
+diet_only_nodes <- tibble(name = unique(c(diet_only_edges$from, diet_only_edges$to))) |>
+  left_join(term_doc_freq, by = c("name" = "word")) |>
+  left_join(term_disease_association, by = "name") |>
+  mutate(
+    df = replace_na(df, 0L),
+    md_association = replace_na(md_association, md_proportion_diet_init),
+    md_association_vis = if_else(
+      md_association <= md_proportion_diet_init,
+      md_association / md_proportion_diet_init * 0.5,
+      0.5 + (md_association - md_proportion_diet_init) / (1 - md_proportion_diet_init) * 0.5
+    )
+  ) |>
+  filter(df >= min_node_n_diet, df <= max_node_n_diet)
+
+diet_only_edges <- diet_only_edges |>
+  filter(from %in% diet_only_nodes$name & to %in% diet_only_nodes$name)
+
+g_diet <- tbl_graph(nodes = diet_only_nodes, edges = diet_only_edges, directed = FALSE) |>
+  activate(nodes) |>
+  mutate(deg = centrality_degree()) |>
+  filter(deg >= degree_filter_diet)
+
+comp_diet <- components(g_diet)
+g_diet <- g_diet |>
+  activate(nodes) |>
+  filter(comp_diet$membership == which.max(comp_diet$csize))
+
+md_proportion_diet <- tokens_filtered |>
+  filter(word %in% V(g_diet)$name) |>
+  distinct(doc_id, word) |>
+  left_join(top_diet_docs |> select(doc_id, disease_type), by = "doc_id") |>
+  pull(disease_type) |>
+  (\(x) mean(x == "Muscular Dystrophy"))()
+
+g_diet <- g_diet |>
+  activate(nodes) |>
+  mutate(md_association_vis = if_else(
+    md_association <= md_proportion_diet,
+    md_association / md_proportion_diet * 0.5,
+    0.5 + (md_association - md_proportion_diet) / (1 - md_proportion_diet) * 0.5
+  ))
+
+cat("Diet-only network: nodes =", gorder(g_diet), ", edges =", gsize(g_diet), "\n")
+cat("MD baseline (network terms):", scales::percent(md_proportion_diet, accuracy = 0.1), "\n")
+```
+
+```{r}
+#| label: plot-diet-only-network
+#| message: false
+#| fig-width: 12
+#| fig-height: 8
+
+set.seed(42)
+p_diet_only <- ggraph(g_diet, layout = "stress") +
+  geom_edge_link(aes(width = weight), alpha = 0.3) +
+  geom_node_point(aes(color = md_association_vis, size = df)) +
+  geom_node_text(aes(label = name, filter = df >= label_min_n_diet), repel = TRUE, size = 3) +
+  scale_edge_width(range = c(0.2, 2.5)) +
+  scale_color_gradientn(
+    colors = c("#007C82", "#00BFC4", "grey85", "#F8766D", "#C44539"),
+    values = scales::rescale(c(0, 0.25, 0.5, 0.75, 1)), limits = c(0, 1),
+    name = "Disease association", breaks = c(0, 0.5, 1),
+    labels = c("Myositis", "Expected", "Muscular Dystrophy")
+  ) +
+  scale_size_continuous(range = c(3, 10), name = "Document\nfrequency") +
+  guides(
+    color = guide_colorbar(order = 1, barheight = unit(35, "mm")),
+    size = guide_legend(order = 2), edge_width = guide_legend(order = 3)
+  ) +
+  labs(
+    title = "Diet-only semantic network: co-occurrence of diet/nutrition terms",
+    caption = paste0("Node color: disease association, rescaled around the diet-term baseline (",
+                     scales::percent(md_proportion_diet, accuracy = 0.1), " MD).\n",
+                     "Teal = disproportionately Myositis. Red = disproportionately MD.\n",
+                     "Based on diet posts with above-average centrality (n = ", n_top, ").")
+  ) +
+  coord_cartesian(clip = "off") +
+  theme_diet_network
+print(p_diet_only)
+ggsave(file.path(fig_dir, "fig6_sub_semantic_network_diet_only.png"), p_diet_only,
+       width = 12, height = 8, dpi = 300, bg = "white")
+```
+
+
+## 6. Community detection
+
+```{r}
+#| label: diet-only-communities
+#| message: false
+#| fig-width: 12
+#| fig-height: 8
+
+# Let the data group the terms for us. The Louvain method hunts for clumps: sets of
+# terms that link to each other far more than to the rest of the network. Nobody tells
+# it what the topics are — it finds them from who-appears-with-whom, and we read the
+# result afterwards and give each clump a name.
+#
+# set.seed(42) just makes it repeatable. The method makes some random choices along
+# the way, so without a fixed starting point you'd get slightly different groups each
+# run. The number 42 has no meaning.
+set.seed(42)
+g_diet <- g_diet |>
+  activate(nodes) |>
+  mutate(community = as.integer(group_louvain(weights = weight)))
+
+# Modularity is a sanity check on the grouping: are the clumps real, or did we just
+# cut an evenly-connected blob into arbitrary pieces? Roughly: below ~0.3 the grouping
+# is weak, ~0.4+ means there genuinely are distinct topics in there.
+n_communities_diet <- n_distinct(V(g_diet)$community)
+modularity_diet <- modularity(igraph::as.igraph(g_diet),
+                              membership = V(g_diet)$community,
+                              weights = igraph::E(g_diet)$weight)
+cat("Diet-only network communities:", n_communities_diet,
+    "| modularity:", round(modularity_diet, 3), "\n\n")
+
+term_disease_counts_diet <- tokens_filtered |>
+  filter(word %in% V(g_diet)$name) |>
+  distinct(doc_id, word) |>
+  left_join(top_diet_docs |> select(doc_id, disease_type), by = "doc_id") |>
+  count(word, disease_type) |>
+  pivot_wider(names_from = disease_type, values_from = n, values_fill = 0L) |>
+  rename(n_myo_docs = Myositis, n_md_docs = `Muscular Dystrophy`)
+
+community_summary_diet <- tibble(
+  term = V(g_diet)$name,
+  community = as.integer(V(g_diet)$community),
+  df = V(g_diet)$df,
+  md_association = V(g_diet)$md_association
+) |>
+  left_join(term_disease_counts_diet, by = c("term" = "word")) |>
+  group_by(community) |>
+  summarise(
+    n_terms = n(),
+    total_myo_docs = sum(n_myo_docs, na.rm = TRUE),
+    total_md_docs = sum(n_md_docs, na.rm = TRUE),
+    pct_myositis = round(total_myo_docs / (total_myo_docs + total_md_docs) * 100, 1),
+    pct_md = round(total_md_docs / (total_myo_docs + total_md_docs) * 100, 1),
+    mean_md_association = round(mean(md_association, na.rm = TRUE), 2),
+    top_terms = paste(head(term[order(-df)], 8), collapse = ", "),
+    .groups = "drop"
+  ) |>
+  arrange(desc(n_terms))
+
+# Interpretive labels assigned from SIGNATURE TERMS among each community's
+# members, not from the Louvain community number. Louvain numbering is run/seed/
+# data dependent, so hard-coding label-by-number silently mislabels clusters when
+# the partition shifts; matching on member terms is stable to renumbering.
+# Signatures are checked in priority order (first match wins), so each signature
+# must key on terms UNIQUE to its cluster. A signature listing terms that appear
+# in two clusters will match both, and they will silently receive the same label.
+# The signatures below are keyed to the current partition:
+#   - produce/plant-based is identified by vegan/vegetarian/fruit/vegetable/fiber
+#   - everyday foods & snacks by oil/snack/nut/seed/rice/cheese (no produce terms)
+# Re-inspect the printed top_terms / exported CSV whenever the thresholds change,
+# and re-key these signatures if the partition shifts.
+label_signatures <- tibble::tribble(
+  ~label,                                     ~terms,
+  "Macronutrients, energy & body composition", c("protein", "creatine", "carb", "calorie", "calory", "fast"),
+  "Micronutrients & supplements",              c("vitamin", "magnesium", "calcium", "zinc", "selenium",
+                                                 "antioxidant", "omega", "turmeric", "curcumin",
+                                                 "supplement", "probiotic", "hmb", "glutamine"),
+  "Plant-based eating & produce",              c("vegan", "vegetarian", "fruit", "vegetable", "fiber"),
+  "Everyday foods, snacks & staples",          c("snack", "oil", "nut", "seed", "chocolate", "legume",
+                                                 "rice", "cheese", "juice", "chicken", "fish")
+)
+
+assign_community_label <- function(terms) {
+  for (i in seq_len(nrow(label_signatures))) {
+    if (any(terms %in% label_signatures$terms[[i]])) return(label_signatures$label[i])
+  }
+  NA_character_
+}
+
+# Build a named vector keyed by community number (fallback = generic name), so
+# the downstream joins/legends are unchanged.
+community_labels <- tibble(term = V(g_diet)$name, community = as.integer(V(g_diet)$community)) |>
+  summarise(label = assign_community_label(term), .by = community) |>
+  mutate(label = coalesce(label, paste0("Community ", community)))
+community_labels <- setNames(community_labels$label, as.character(community_labels$community))
+
+community_summary_diet <- community_summary_diet |>
+  mutate(community_label = community_labels[as.character(community)])
+
+g_diet <- g_diet |>
+  activate(nodes) |>
+  mutate(community_label = community_labels[as.character(community)])
+
+cat("Community summary (inspect top_terms to assign interpretive labels):\n")
+print(community_summary_diet |>
+        select(community, n_terms, pct_myositis, pct_md, mean_md_association, top_terms))
+
+# Export the exact partition for reproducibility / label verification (Louvain
+# numbers are run-sensitive, so labels must be checked against THIS table).
+readr::write_csv(community_summary_diet,
+                 file.path(fig_dir, "sub_diet_community_summary.csv"))
+readr::write_csv(g_diet |> activate(nodes) |> as_tibble() |>
+                   select(term = name, community, df, md_association),
+                 file.path(fig_dir, "sub_diet_community_nodes.csv"))
+
+community_pal_diet <- scales::hue_pal()(n_communities_diet)
+names(community_pal_diet) <- seq_len(n_communities_diet)
+community_legend_labels <- setNames(paste0(names(community_labels), ": ", community_labels),
+                                    names(community_labels))
+
+p_diet_communities <- ggraph(g_diet, layout = "stress") +
+  geom_edge_link(aes(width = weight), alpha = 0.3) +
+  geom_node_point(aes(color = factor(community), size = df)) +
+  geom_node_text(aes(label = name, filter = df >= label_min_n_diet), repel = TRUE, size = 3) +
+  scale_edge_width(range = c(0.2, 2.5)) +
+  scale_color_manual(values = community_pal_diet, labels = community_legend_labels, name = "Community") +
+  scale_size_continuous(range = c(3, 10), name = "Document\nfrequency") +
+  guides(
+    color = guide_legend(order = 1, override.aes = list(size = 5)),
+    size = guide_legend(order = 2), edge_width = guide_legend(order = 3)
+  ) +
+  labs(title = "Diet-only semantic network — communities",
+       caption = paste0("Louvain community detection on diet term co-occurrence (n = ", n_top, " posts).")) +
+  coord_cartesian(clip = "off") +
+  theme_diet_network
+print(p_diet_communities)
+ggsave(file.path(fig_dir, "fig5_sub_semantic_network_diet_only_communities.png"),
+       p_diet_communities, width = 12, height = 8, dpi = 300, bg = "white")
+```
+
+
+```{r}
+#| label: permutation-test-diet
+#| message: false
+
+# Are the topic groups actually split along disease lines?
+#
+# Looking at the figure, some clusters look more "myositis" and others more "MD". But
+# eyes find patterns in noise, so we test it by shuffling.
+#
+# The idea: take each term's disease leaning and deal those leanings out at random
+# among the groups, 1,000 times over. Each time, measure how far apart the groups end
+# up. That gives us a picture of what "no real pattern" looks like. Then compare the
+# real spread to that picture. If the real groups are further apart than almost all of
+# the shuffles, the pattern is unlikely to be chance — and the p-value is simply the
+# share of shuffles that matched or beat reality.
+#
+# We shuffle terms, not mentions: each diet term counts once. Mentions from the same
+# post aren't independent of each other, which would make the test look more certain
+# than it deserves.
+set.seed(123)
+n_perm <- 1000
+md_aff_values <- V(g_diet)$md_association
+comm_values   <- V(g_diet)$community
+
+association_var_null <- numeric(n_perm)
+for (i in seq_len(n_perm)) {
+  shuffled <- sample(md_aff_values)
+  association_var_null[i] <- tapply(shuffled, comm_values, mean) |> var(na.rm = TRUE)
+}
+observed_var <- tapply(md_aff_values, comm_values, mean) |> var(na.rm = TRUE)
+p_value_perm <- mean(association_var_null >= observed_var)
+
+cat("Permutation test — disease association clustering (n =", n_perm, "):\n")
+cat("  Observed between-community variance:", round(observed_var, 4), "\n")
+cat("  P-value:", round(p_value_perm, 4), "\n")
+cat("  Interpretation:",
+    if_else(p_value_perm < 0.05,
+            "Communities differ significantly in disease association.",
+            "No significant clustering of disease association within communities."), "\n\n")
+cat("Mean MD association per community:\n")
+tapply(md_aff_values, comm_values, mean) |> round(3) |> print()
+```

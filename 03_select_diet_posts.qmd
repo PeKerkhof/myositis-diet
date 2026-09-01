@@ -1,0 +1,246 @@
+---
+title: "Subreddit Diet Pipeline — 3. Diet Selection and Centrality"
+subtitle: "Match the lemmatized diet word list and score diet centrality per post"
+author: "Peter Kerkhof"
+date: last-modified
+format:
+  html: default
+  pdf: default
+  docx: default
+editor: visual
+execute:
+  echo: false
+  warning: false
+editor_options:
+  chunk_output_type: inline
+always_allow_html: yes
+---
+
+## 1. Setup
+
+```{r}
+#| message: false
+#| label: setup-environment
+
+rm(list = ls()[!sapply(ls(), function(x) is.function(get(x)))])
+cat("\014")
+options(scipen = 999)
+
+# Keep non-ASCII characters (>=, em-dash) intact in figures and printed output.
+# Running from a bare terminal can start R in a non-UTF-8 locale, which silently
+# turns them into "<U+2265>" in plot labels and console output. RStudio already
+# sets a UTF-8 locale, so this is only a safety net for terminal/CI runs.
+if (!isTRUE(l10n_info()[["UTF-8"]])) {
+  invisible(suppressWarnings(Sys.setlocale("LC_CTYPE", "en_US.UTF-8")))
+}
+
+# -----------------------------------------------------------------------------
+# HOW MUCH IS THIS POST *ABOUT* DIET?
+# -----------------------------------------------------------------------------
+# Here we select posts that mention at least one diet term. 
+# Yet, mentioning a diet word isn't the same as talking about diet. Someone can write three
+# paragraphs about their prednisone and end with "oh, and I've cut out sugar" — that's
+# a diet mention, but the post isn't about diet. We want a score that tells the two
+# apart, so we can look at the posts where food really is the subject.
+
+library(tidyverse)
+library(here)
+library(arrow)
+library(tidytext)
+library(knitr)
+
+source(here("config.R"))
+
+if (!exists("perc_table")) {
+  perc_table <- function(df, column_name) {
+    df |>
+      count(!!rlang::sym(column_name), sort = TRUE, name = "count") |>
+      mutate(
+        relative_freq_pct = (count / sum(count)) * 100,
+        cumulative_freq_pct = cumsum(relative_freq_pct),
+        across(ends_with("_pct"), ~ round(.x, 1))
+      )
+  }
+}
+```
+
+## 2. Load lemmatized subreddit data and word list
+
+```{r}
+#| message: false
+#| label: load-data
+
+df <- arrow::read_feather(
+  file.path(DATA_PATH, "data/myo_dys_subreddits_lemmatized_2005_jul2026.feather")
+)
+
+diet_terms_lemmatized <- readRDS(
+  file.path(DATA_PATH, "word_lists/diet_terms_lemmatized.RDS")
+)
+
+cat("Loaded", scales::comma(nrow(df)), "subreddit posts\n")
+cat("Diet word list:", nrow(diet_terms_lemmatized), "terms\n")
+print(df |> count(disease_type))
+```
+
+## 3. Tokenize and match diet terms
+
+```{r}
+#| message: false
+#| label: tokenize-and-match
+
+tokens <- df |>
+  select(doc_id, text = lemmatized_text) |>
+  filter(!is.na(text)) |>
+  unnest_tokens(word, text)
+
+cat("Total tokens:", scales::comma(nrow(tokens)), "\n")
+
+all_diet_matches <- tokens |>
+  inner_join(diet_terms_lemmatized, by = "word") |>
+  select(doc_id, word)
+
+cat("Total diet term matches:", scales::comma(nrow(all_diet_matches)), "\n")
+cat("Posts with at least one match:", scales::comma(n_distinct(all_diet_matches$doc_id)), "\n")
+
+diet_counts_per_post <- all_diet_matches |>
+  group_by(doc_id) |>
+  summarise(
+    n_diet_tokens = n(),
+    n_diet_terms  = n_distinct(word),
+    diet_terms_matched = paste(sort(unique(word)), collapse = ", "),
+    .groups = "drop"
+  )
+
+if ("n_tokens" %in% names(df)) df <- df |> select(-n_tokens)
+post_len <- tokens |> count(doc_id, name = "n_tokens")
+
+df <- df |>
+  left_join(post_len, by = "doc_id") |>
+  left_join(diet_counts_per_post, by = "doc_id") |>
+  mutate(
+    n_tokens      = replace_na(n_tokens, 0L),
+    n_diet_tokens = replace_na(n_diet_tokens, 0L),
+    n_diet_terms  = replace_na(n_diet_terms, 0L),
+    diet_terms_matched = replace_na(diet_terms_matched, "")
+  )
+```
+
+## 4. Diet centrality score
+
+```{r}
+#| message: false
+#| label: diet-centrality
+
+# Diet centrality score is built from two parts:
+#   1. How dense? What share of the post's words are diet words. One diet word in a
+#      50-word post may be background noise; ten in a 50-word post is clearly on-topic.
+#   2. How varied? How many DIFFERENT diet words appear. Saying "protein" eight times
+#      is one idea repeated; saying protein, carbs, calories and fibre sounds more like 
+#.     a genuine discussion of nutrition. We take a log of this so the count still counts, 
+#      but going from 1 to 2 different words matters more than going from 9 to 10.
+# Multiply the two together results in the diet centrality score.
+
+df <- df |>
+  mutate(
+    diet_density    = n_diet_tokens / pmax(n_tokens, 1),
+    diet_centrality = diet_density * log1p(n_diet_terms)
+  )
+
+# From here on we only look at posts that mention diet at all (see the note below on
+# why the posts with no diet words have to be left out).
+df_diet <- df |>
+  filter(n_diet_tokens > 0) |>
+  arrange(desc(diet_centrality))
+
+cat("=== Diet Centrality Summary (diet posts) ===\n")
+cat("Diet posts (>= 1 diet term):", scales::comma(nrow(df_diet)), "\n")
+cat("Median diet centrality:", round(median(df_diet$diet_centrality), 4), "\n")
+cat("Max diet centrality:", round(max(df_diet$diet_centrality), 4), "\n")
+
+# Correcting for post length.
+# The score above has a built-in bias: short posts score high too easily. A two-line
+# "anyone tried creatine?" is nearly all diet words, while a long, thoughtful post
+# about someone's nutrition gets diluted by everything else they wrote. Left alone,
+# we'd end up studying one-liners.
+#
+# So we fit a line describing the usual relationship between post length and the
+# score, then keep the RESIDUAL — how far each post sits above or below what's typical
+# for a post of its length. A positive residual means: for its size, this post is
+# unusually focused on diet. That residual is what we use from here on, and the
+# printouts below confirm the length bias is gone afterwards (r drops to ~0).
+#
+# Posts with no diet words get no score (NA).
+
+r_test <- cor.test(df_diet$n_tokens, df_diet$diet_centrality)
+cat(sprintf("\nLength vs raw centrality (diet posts): r = %.3f, p = %.2e\n",
+            r_test$estimate, r_test$p.value))
+
+fit <- lm(diet_centrality ~ log1p(n_tokens), data = df_diet)
+df_diet$diet_centrality_adj <- residuals(fit)
+cat(sprintf("Model R-squared: %.3f, slope: %.5f\n", summary(fit)$r.squared, coef(fit)[2]))
+
+r_adj <- cor.test(df_diet$n_tokens, df_diet$diet_centrality_adj)
+cat(sprintf("After adjustment: r = %.3f, p = %.3f\n", r_adj$estimate, r_adj$p.value))
+
+# Put the adjusted score back on the full dataset (posts with no diet words get NA).
+df <- df |> left_join(df_diet |> select(doc_id, diet_centrality_adj), by = "doc_id")
+df_diet <- df_diet |> arrange(desc(diet_centrality_adj))
+```
+
+## 5. Summary: diet-mention rate by disease group
+
+```{r}
+#| message: false
+#| label: summary
+
+cat("=== Diet-mention rate by disease group ===\n")
+df |>
+  summarise(
+    n_posts = n(),
+    n_diet_posts = sum(n_diet_tokens > 0),
+    pct_diet = round(mean(n_diet_tokens > 0) * 100, 1),
+    .by = disease_type
+  ) |>
+  print()
+
+cat("\n=== Diet posts by subreddit ===\n")
+df_diet |> count(subreddit, disease_type, sort = TRUE) |> print()
+
+cat("\n=== Top 20 diet terms ===\n")
+all_diet_matches |>
+  count(word, sort = TRUE) |>
+  slice_head(n = 20) |>
+  print()
+
+# Cutoff comparison
+cutoff_table <- tibble(
+  Criterion = c("any diet term", "diet_centrality_adj > 0",
+                "n_diet_terms >= 2", "n_diet_terms >= 3", "n_diet_terms >= 4"),
+  `Posts remaining` = c(
+    nrow(df_diet),
+    sum(df_diet$diet_centrality_adj > 0),
+    sum(df_diet$n_diet_terms >= 2),
+    sum(df_diet$n_diet_terms >= 3),
+    sum(df_diet$n_diet_terms >= 4)
+  )
+) |>
+  mutate(`% of diet posts` = round(`Posts remaining` / nrow(df_diet) * 100, 1))
+kable(cutoff_table, caption = "Diet centrality cutoffs (among posts with >= 1 diet term)")
+```
+
+## 6. Save outputs
+
+```{r}
+#| message: false
+#| label: save-outputs
+
+diet_output_path <- file.path(DATA_PATH, "data/myo_dys_subreddits_diet_posts_2005_jul2026.feather")
+write_feather(df_diet, diet_output_path)
+cat("Saved", scales::comma(nrow(df_diet)), "diet posts to:\n ", diet_output_path, "\n\n")
+
+full_output_path <- file.path(DATA_PATH, "data/myo_dys_subreddits_with_diet_counts_2005_jul2026.feather")
+write_feather(df, full_output_path)
+cat("Saved full four-subreddit set to:\n ", full_output_path,
+    "(", scales::comma(nrow(df)), "rows )\n")
+```

@@ -1,0 +1,709 @@
+---
+title: "Subreddit Diet Pipeline — 4. Diet-Term Frequencies and Myositis vs MD Comparison"
+subtitle: "Diet-mention rates over time, top terms by group, and per-term disease contrasts"
+author: "Peter Kerkhof"
+date: last-modified
+format:
+  html: default
+  pdf: default
+  docx: default
+editor: visual
+execute:
+  echo: false
+  warning: false
+editor_options:
+  chunk_output_type: inline
+always_allow_html: yes
+---
+
+## 1. Setup
+
+```{r}
+#| message: false
+#| label: setup-environment
+
+rm(list = ls()[!sapply(ls(), function(x) is.function(get(x)))])
+cat("\014")
+options(scipen = 999)
+
+# Keep non-ASCII characters (>=, em-dash) intact in figures and printed output.
+# Running from a bare terminal can start R in a non-UTF-8 locale, which silently
+# turns them into "<U+2265>" in plot labels and console output. RStudio already
+# sets a UTF-8 locale, so this is only a safety net for terminal/CI runs.
+if (!isTRUE(l10n_info()[["UTF-8"]])) {
+  invisible(suppressWarnings(Sys.setlocale("LC_CTYPE", "en_US.UTF-8")))
+}
+
+library(tidyverse)
+library(here)
+library(tidytext)
+library(knitr)
+
+source(here("config.R"))
+
+fig_dir <- file.path(DATA_PATH, "figures")
+dir.create(fig_dir, showWarnings = FALSE, recursive = TRUE)
+
+if (!exists("perc_table")) {
+  perc_table <- function(df, column_name) {
+    df |>
+      count(!!rlang::sym(column_name), sort = TRUE, name = "count") |>
+      mutate(
+        relative_freq_pct = (count / sum(count)) * 100,
+        cumulative_freq_pct = cumsum(relative_freq_pct),
+        across(ends_with("_pct"), ~ round(.x, 1))
+      )
+  }
+}
+
+# Colors: teal = Myositis, red = Muscular Dystrophy
+disease_colors <- c("Muscular Dystrophy" = "#F8766D", "Myositis" = "#00BFC4")
+
+theme_diet <- theme_minimal(base_size = 12) +
+  theme(
+    plot.title.position = "plot",
+    plot.margin = margin(10, 10, 10, 10),
+    plot.caption = element_text(size = 9, color = "grey40", hjust = 0)
+  )
+
+theme_diet_network <- theme_diet +
+  theme(
+    axis.text = element_blank(),
+    axis.title = element_blank(),
+    axis.ticks = element_blank(),
+    legend.position = "right",
+    legend.box = "vertical"
+  )
+```
+
+## 2. Load diet posts and word list
+
+```{r}
+#| message: false
+#| label: load-data
+
+# Diet posts from the four dedicated subreddits (output of script 03).
+# Already carries lemmatized_text, disease_type, and centrality scores —
+# no LLM filtering or join needed.
+df_diet <- arrow::read_feather(
+  file.path(DATA_PATH, "data/myo_dys_subreddits_diet_posts_2005_jul2026.feather")
+)
+
+diet_terms_lemmatized <- readRDS(
+  file.path(DATA_PATH, "word_lists/diet_terms_lemmatized.RDS")
+)
+
+cat("Diet posts:", scales::comma(nrow(df_diet)), "\n")
+print(df_diet |> count(disease_type))
+cat("Diet word list:", nrow(diet_terms_lemmatized), "terms\n")
+```
+
+## 3. Diet-mention prevalence
+
+```{r}
+#| label: diet-rate-data
+#| message: false
+
+# Full four-subreddit set (ALL posts, not just diet) — this is the denominator
+# for the diet-mention *rate*. Diet posts are the n_diet_tokens > 0 subset (= df_diet).
+df_all <- arrow::read_feather(
+  file.path(DATA_PATH, "data/myo_dys_subreddits_with_diet_counts_2005_jul2026.feather")
+)
+
+cat("Posts:", scales::comma(nrow(df_all)),
+    "| diet posts:", scales::comma(sum(df_all$n_diet_tokens > 0)), "\n")
+```
+
+
+### 3a. Whole-thread diet-mention rate
+
+The rate above is per *post*. But a single diet-focused conversation can be one submission with dozens of off-topic replies (diluting the post-level rate), or a diet term raised once deep in an otherwise unrelated thread. A complementary view rolls the post-level counts up to the **thread** — a submission plus every comment and reply beneath it, grouped by Reddit's `link_id` (`t3_<submission id>`) — and asks what share of whole *conversations* touch on diet anywhere within them.
+
+```{r}
+#| label: thread-diet-rate-data
+#| message: false
+
+# Reconstruct the thread key. Submissions are their own root; comments and
+# comment-to-comments carry link_id = "t3_<submission id>", so stripping the
+# prefix maps every post to its thread root (whether or not the root submission
+# itself is in the data).
+thread_keys <- df_all |>
+  mutate(
+    link_root = str_remove(coalesce(as.character(link_id), ""), "^t3_"),
+    thread_id = if_else(post_type == "submission" | link_root == "", id, link_root)
+  ) |>
+  mutate(n_posts_in_thread = n(), .by = thread_id)
+
+# Distinct diet terms occurring ANYWHERE in the thread: explode each post's
+# comma-separated matched-term list, then count the union per thread. This is the
+# thread-level analogue of the post-level n_diet_terms used above.
+thread_terms <- thread_keys |>
+  filter(diet_terms_matched != "") |>
+  separate_longer_delim(diet_terms_matched, delim = ", ") |>
+  distinct(disease_type, thread_id, term = diet_terms_matched) |>
+  count(disease_type, thread_id, name = "n_diet_terms")
+
+threads <- thread_keys |>
+  summarise(
+    n_diet_tokens = sum(n_diet_tokens),
+    n_posts       = n(),
+    .by = c(disease_type, thread_id)
+  ) |>
+  left_join(thread_terms, by = c("disease_type", "thread_id")) |>
+  mutate(n_diet_terms = replace_na(n_diet_terms, 0L))
+
+cat("Threads:", scales::comma(nrow(threads)),
+    "| diet threads:", scales::comma(sum(threads$n_diet_terms > 0)),
+    "| mean posts/thread:", round(mean(threads$n_posts), 1), "\n")
+
+# Period-wide prevalence at >= 1 diet term: post unit vs thread unit, side by side.
+bind_rows(
+  df_all  |> summarise(unit = "post",   n = n(), diet = sum(n_diet_terms >= 1), .by = disease_type),
+  threads |> summarise(unit = "thread", n = n(), diet = sum(n_diet_terms >= 1), .by = disease_type)
+) |>
+  mutate(rate = scales::percent(diet / n, accuracy = 0.1)) |>
+  arrange(disease_type, unit) |>
+  print()
+```
+
+
+### 3b. Thread length and diet mentions
+
+A thread counts as a diet thread if a diet term appears *anywhere* in it, so the longer a conversation runs, the more likely it touches on diet. Rather than treat that as a nuisance, we report it directly: (1) the thread-size distribution of each community, (2) how the diet-mention rate scales with thread length, alongside the share of each disease's threads at that size, and (3) a length-adjusted model isolating the length effect. The take-home is that the post-level rate — which weights every post equally and is dominated by single-post threads — *understates* how often diet/nutrition actually comes up in sustained discussion.
+
+```{r}
+#| label: thread-length-diagnostics
+#| message: false
+
+threads <- threads |>
+  mutate(size_band = cut(
+    n_posts, breaks = c(0, 1, 3, 10, Inf),
+    labels = c("1 (singleton)", "2–3", "4–10", "11+")
+  ))
+
+# (1) Thread-size distribution by disease — sanity-checks the thread counts and
+# exposes the length asymmetry driving the post-vs-thread divergence.
+cat("=== Thread-size distribution by disease ===\n")
+threads |>
+  summarise(
+    n_threads      = n(),
+    pct_singletons = scales::percent(mean(n_posts == 1), accuracy = 0.1),
+    median_posts   = median(n_posts),
+    mean_posts     = round(mean(n_posts), 1),
+    p90_posts      = quantile(n_posts, 0.9),
+    max_posts      = max(n_posts),
+    .by = disease_type
+  ) |>
+  arrange(disease_type) |>
+  print()
+
+# (2) Diet-thread rate within thread-size bands, plus the share of each disease's
+# threads that fall in each band. Diet mentions climb steeply with thread length;
+# the diseases differ mostly in how their threads are distributed across sizes
+# (MD overwhelmingly singletons) rather than in the per-size diet rate.
+cat("\n=== Diet-thread rate and thread-size composition by disease ===\n")
+rate_by_band <- threads |>
+  summarise(
+    n_threads = n(),
+    diet      = sum(n_diet_terms >= 1),
+    .by = c(disease_type, size_band)
+  ) |>
+  mutate(
+    pct_of_threads = n_threads / sum(n_threads),  # within-disease composition
+    diet_rate      = diet / n_threads,
+    .by = disease_type
+  ) |>
+  arrange(disease_type, size_band)
+
+rate_by_band |>
+  transmute(
+    Disease = disease_type,
+    `Thread size (posts)` = size_band,
+    Threads = n_threads,
+    `% of disease's threads` = scales::percent(pct_of_threads, accuracy = 0.1),
+    `Diet-thread rate` = scales::percent(diet_rate, accuracy = 0.1)
+  ) |>
+  kable(caption = paste(
+    "Diet-thread rate by thread size, with each disease's thread-size composition.",
+    "Diet mentions rise steeply with thread length; because most MD threads are single",
+    "posts, the post-level rate understates how often diet arises in sustained discussion."
+  ))
+thread_keys$n_posts_in_thread
+
+```
+
+```{r}
+#| label: thread-length-adjusted-model
+#| message: false
+
+# (3) Length-adjusted comparison: logistic regression of diet-thread status on
+# disease group, controlling for log thread size. The disease odds ratio is the
+# gap that remains AFTER holding thread length constant. MD is the reference
+# level (alphabetical), so the Myositis OR answers: at a given thread length, are
+# myositis conversations disproportionately likely to mention diet?
+threads_mod <- threads |> mutate(is_diet = as.integer(n_diet_terms >= 1))
+m_thread <- glm(is_diet ~ disease_type + log(n_posts), data = threads_mod,
+                family = binomial)
+
+cat("Length-adjusted thread-level model (odds ratios, 95% CI):\n")
+broom::tidy(m_thread, conf.int = TRUE, exponentiate = TRUE) |>
+  mutate(across(where(is.numeric), ~ round(.x, 3))) |>
+  print()
+
+or_myo <- exp(coef(m_thread)["disease_typeMyositis"])
+p_myo  <- coef(summary(m_thread))["disease_typeMyositis", "Pr(>|z|)"]
+
+# Thread length enters as log(n_posts), so the raw coefficient is "per +1 on the
+# log scale" = per e-fold (x2.718) increase — mathematically natural but awkward
+# to read. Rescaling by log(2) expresses the same effect per DOUBLING of thread
+# length, which is what we report. Same model, friendlier units.
+or_len_double <- exp(coef(m_thread)["log(n_posts)"] * log(2))
+
+# Phrase the residual disease effect from the fitted values so the text can never
+# contradict the numbers if the upstream data changes.
+disease_msg <- if (p_myo >= 0.05) {
+  sprintf("the disease gap is essentially null (Myositis OR = %.2f, p = %.2f), so diet is referenced at equivalent per-thread rates in both communities",
+          or_myo, p_myo)
+} else {
+  sprintf("a modest disease difference remains (Myositis OR = %.2f, p = %s): at equal thread length, %s threads are somewhat %s likely to mention diet than %s threads",
+          or_myo, format.pval(p_myo, digits = 2, eps = 1e-4),
+          if (or_myo > 1) "myositis" else "MD",
+          if (or_myo > 1) "more" else "less",
+          if (or_myo > 1) "MD" else "myositis")
+}
+
+cat(sprintf(
+  paste0("\nThread length is the dominant driver: each doubling of thread length\n",
+         "multiplies the odds of a diet mention by %.2fx. After adjusting for length, %s.\n",
+         "The post-level rate, dominated by short threads, still understates how often\n",
+         "diet/nutrition comes up in sustained discussion.\n"),
+  or_len_double, disease_msg))
+```
+
+```{r}
+#| label: plot-thread-rate-by-size
+#| message: false
+#| fig-width: 9
+#| fig-height: 5.5
+
+p_thread_band <- rate_by_band |>
+  ggplot(aes(x = size_band, y = diet_rate, fill = disease_type)) +
+  geom_col(position = position_dodge(0.7), width = 0.65) +
+  geom_text(aes(label = scales::percent(diet_rate, accuracy = 1)),
+            position = position_dodge(0.7), vjust = -0.4, size = 3) +
+  scale_fill_manual(values = disease_colors, name = NULL) +
+  scale_y_continuous(labels = scales::percent_format(),
+                     limits = c(0, NA), expand = expansion(mult = c(0, 0.12))) +
+  labs(
+    title = "Diet/nutrition mentions rise steeply with thread length",
+    subtitle = "Share of threads with ≥ 1 diet term, by thread size, for each disease",
+    x = "Posts per thread", y = "Diet-thread rate",
+    # or_len_double comes from the length-adjusted model above — never hard-code it
+    # here, or the caption silently goes stale when the archive is refreshed.
+    caption = paste0(
+      sprintf("Each doubling of thread length multiplies the odds of a diet mention %.2fx (logistic model).\n",
+              or_len_double),
+      "Post-level counting is dominated by single-post threads and so understates diet/nutrition discussion.")
+  ) +
+  theme_diet +
+  theme(legend.position = "top", panel.grid.major.x = element_blank())
+print(p_thread_band)
+ggsave(file.path(fig_dir, "fig1_sub_diet_thread_rate_by_size.png"), p_thread_band,
+       width = 9, height = 5.5, dpi = 300, bg = "white")
+```
+
+## 4. Tokenize and top diet terms by disease group
+
+```{r}
+#| message: false
+#| label: tokenize
+
+tokens <- df_diet |>
+  select(doc_id, text = lemmatized_text) |>
+  filter(!is.na(text)) |>
+  unnest_tokens(word, text)
+
+cat("Total tokens:", scales::comma(nrow(tokens)), "\n")
+```
+
+```{r}
+#| label: top-diet-terms-by-group
+#| message: false
+#| fig-width: 10
+#| fig-height: 8
+
+diet_matches_by_group <- tokens |>
+  inner_join(diet_terms_lemmatized, by = "word") |>
+  left_join(df_diet |> select(doc_id, disease_type), by = "doc_id")
+
+top20_by_group <- diet_matches_by_group |>
+  count(disease_type, word, sort = TRUE) |>
+  group_by(disease_type) |>
+  slice_head(n = 20) |>
+  mutate(rank = row_number()) |>
+  ungroup()
+
+cat("=== Top 20 diet terms: Myositis ===\n")
+top20_by_group |> filter(disease_type == "Myositis") |> select(rank, word, n) |> print(n = 20)
+cat("\n=== Top 20 diet terms: Muscular Dystrophy ===\n")
+top20_by_group |> filter(disease_type == "Muscular Dystrophy") |> select(rank, word, n) |> print(n = 20)
+
+group_totals <- diet_matches_by_group |> count(disease_type, name = "total_diet_tokens")
+
+p_top20 <- top20_by_group |>
+  left_join(group_totals, by = "disease_type") |>
+  mutate(
+    proportion = n / total_diet_tokens,
+    word = reorder_within(word, proportion, disease_type)
+  ) |>
+  ggplot(aes(x = proportion, y = word, fill = disease_type)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ disease_type, scales = "free_y") +
+  scale_y_reordered() +
+  scale_x_continuous(labels = scales::percent_format()) +
+  scale_fill_manual(values = disease_colors) +
+  labs(
+    title = "Top 20 diet terms by disease group",
+    subtitle = "As proportion of all diet term occurrences within each group",
+    x = "Proportion of diet term occurrences", y = NULL
+  ) +
+  theme_diet +
+  theme(strip.text = element_text(face = "bold", size = 12))
+print(p_top20)
+ggsave(file.path(fig_dir, "fig2_sub_top20_diet_terms_by_disease.png"), p_top20,
+       width = 10, height = 8, dpi = 300, bg = "white")
+```
+
+## 5. Diet term frequency: Muscular Dystrophy vs Myositis
+
+The group contrast is reported on two post sets, mirroring section 6:
+
+- **5a — Primary: all diet posts.** Every post with ≥ 1 diet term. More posts, and no reliance on a centrality cutoff, so the comparison is better powered and easier to defend.
+- **5b — Sensitivity: focal set** (above-average diet centrality for post length). Fewer posts, but each is genuinely diet-focused. Re-running the same comparison here checks the pattern is not driven by passing mentions.
+
+```{r}
+#| label: define-sets
+#| message: false
+
+# top_diet_docs / n_top are the focal (sensitivity) set here. The semantic-network
+# script (05) reconstructs the same set independently.
+top_diet_docs <- df_diet |> filter(diet_centrality_adj > 0)
+n_top <- nrow(top_diet_docs)
+
+cat("Primary set — all diet posts:", nrow(df_diet), "\n")
+print(table(df_diet$disease_type))
+cat("\nSensitivity set — focal (above-average diet centrality):", n_top, "\n")
+print(table(top_diet_docs$disease_type))
+```
+
+```{r}
+#| label: freq-comparison-helpers
+#| message: false
+
+# Diet-term frequency comparison between disease groups, parameterized by the
+# post set so the same code runs on the primary set (all diet posts) and the
+# sensitivity set (focal). `tokens` is the section-4 tokenization of ALL diet
+# posts, so each set is obtained with a semi_join to its doc_ids.
+
+diet_tokens_for <- function(docs) {
+  tokens |>
+    semi_join(docs |> select(doc_id), by = "doc_id") |>
+    inner_join(diet_terms_lemmatized, by = "word") |>
+    left_join(docs |> select(doc_id, disease_type), by = "doc_id")
+}
+
+freq_by_group_data <- function(docs) {
+  fbg <- diet_tokens_for(docs) |>
+    count(disease_type, word) |>
+    mutate(proportion = n / sum(n), .by = disease_type) |>
+    select(-n) |>
+    pivot_wider(names_from = disease_type, values_from = proportion, values_fill = 0)
+
+  freq_floor <- min(
+    fbg$`Muscular Dystrophy`[fbg$`Muscular Dystrophy` > 0],
+    fbg$Myositis[fbg$Myositis > 0]
+  ) / 2
+
+  fbg |>
+    mutate(
+      `Muscular Dystrophy` = pmax(`Muscular Dystrophy`, freq_floor),
+      Myositis             = pmax(Myositis, freq_floor),
+      log_ratio  = log2((`Muscular Dystrophy` + 1e-5) / (Myositis + 1e-5)),
+      total_freq = `Muscular Dystrophy` + Myositis,
+      show_label = abs(log_ratio) > 1 | rank(-total_freq) <= 15
+    )
+}
+
+plot_freq_scatter <- function(fbg, scope, n_docs) {
+  ggplot(fbg, aes(x = Myositis, y = `Muscular Dystrophy`, color = log_ratio)) +
+    geom_point(alpha = 0.7, size = 2.5) +
+    ggrepel::geom_text_repel(
+      data = \(d) filter(d, show_label), aes(label = word),
+      size = 3, max.overlaps = 30, segment.color = "grey60", segment.size = 0.3,
+      box.padding = 0.3, point.padding = 0.2, min.segment.length = 0.1,
+      # label repulsion draws on the RNG, so without a seed the same data gives
+      # visibly different label positions on every render
+      seed = 42
+    ) +
+    geom_abline(color = "grey30", linewidth = 0.5, linetype = "dashed") +
+    scale_color_gradientn(
+      colors = c("#007C82", "#00BFC4", "grey85", "#F8766D", "#C44539"),
+      values = scales::rescale(c(-1, -0.5, 0, 0.5, 1)),
+      limits = max(abs(fbg$log_ratio)) * c(-1, 1),
+      name = "MD / Myositis ratio", breaks = c(-2, 0, 2),
+      labels = c("Myositis", "Equal", "MD"),
+      # left-align the key labels; guide_colourbar centres them by default
+      guide = guide_colourbar(
+        theme = theme(legend.text = element_text(hjust = 0))
+      )
+    ) +
+    scale_x_log10(labels = scales::percent_format()) +
+    scale_y_log10(labels = scales::percent_format()) +
+    labs(
+      title = "Diet/nutrition term frequency: Muscular Dystrophy vs Myositis",
+      subtitle = scope,
+      x = "Myositis", y = "Muscular Dystrophy",
+      caption = paste0("Color: log2 frequency ratio. Terms near the diagonal are used at similar rates.\n",
+                       "Teal = Myositis-characteristic. Red = MD-characteristic.\n",
+                       scope, " (n = ", n_docs, " posts).")
+    ) +
+    theme_diet
+}
+```
+
+### 5a. Primary set: all diet posts
+
+```{r}
+#| label: freq-primary
+#| message: false
+#| fig-width: 8
+#| fig-height: 8
+
+p_freq_primary <- plot_freq_scatter(
+  freq_by_group_data(df_diet), "All diet posts", nrow(df_diet)
+)
+print(p_freq_primary)
+ggsave(file.path(fig_dir, "fig4_sub_diet_term_frequency_md_vs_myo.png"), p_freq_primary,
+       width = 8, height = 8, dpi = 300, bg = "white")
+```
+
+### 5b. Sensitivity set: focal (above-average diet centrality)
+
+```{r}
+#| label: freq-focal
+#| message: false
+#| fig-width: 8
+#| fig-height: 8
+
+p_freq_focal <- plot_freq_scatter(
+  freq_by_group_data(top_diet_docs),
+  "Focal diet posts (above-average diet centrality)", n_top
+)
+print(p_freq_focal)
+ggsave(file.path(fig_dir, "figA1_sub_diet_term_frequency_md_vs_myo_focal.png"), p_freq_focal,
+       width = 8, height = 8, dpi = 300, bg = "white")
+```
+
+## 6. Diet terms by disease group (direct MD vs Myositis split)
+
+We test each individual diet term's MD-vs-Myositis split against the overall baseline (per-term binomial test, BH-adjusted). We report it on two sets:
+
+- **6a — Focal set** (above-average diet centrality): only the genuinely diet-focused posts (the same focal set used by the semantic-network script, `05_semantic_network_analysis.qmd`).
+- **6b — All diet posts** (\~3× the data): better powered, at the cost of including passing diet mentions. This is the primary set reported in the manuscript.
+
+```{r}
+#| label: signature-terms-helpers
+#| message: false
+
+# Which diet terms belong to which patient group?
+#
+# For each term we ask: of the posts mentioning it, what share are MD posts? Then we
+# compare that to the baseline — the ~81% you'd expect anyway, because there are simply
+# more MD posts. A term is interesting only if it's clearly above or below that line.
+#
+# The binomial test asks the same question a coin-toss question: if this term were
+# handed out at random with an 81% chance of landing in an MD post, how surprised
+# should we be by what we actually see? That surprise is the p-value.
+#
+# The multiple-testing correction: we run this for ~65 terms, and at 1-in-20 odds a few
+# would look "significant" by luck alone. The Benjamini-Hochberg step raises the bar to
+# account for that. The adjusted p is what we report, and it's why a term can look
+# convincing on its own yet not survive the table.
+#
+# We only test terms appearing in at least 10 posts (min_docs) — below that the share
+# is too jumpy to mean anything. Generic, low-content diet words are excluded via
+# custom_stop_words: knowing "food" appears in both groups tells us nothing.
+custom_stop_words <- tibble(word = c("eat", "food", "drink", "feed", "nutrition",
+                                     "consume", "ingredient"))
+
+term_disease_split <- function(posts, diet_terms, stops, min_docs = 10L) {
+  pairs <- posts |>
+    select(doc_id, disease_type, text = lemmatized_text) |>
+    filter(!is.na(text)) |>
+    unnest_tokens(word, text) |>
+    distinct(doc_id, disease_type, word) |>
+    inner_join(diet_terms, by = "word") |>
+    anti_join(stops, by = "word")
+  baseline_md <- mean(pairs$disease_type == "Muscular Dystrophy")
+  pairs |>
+    count(word, disease_type) |>
+    pivot_wider(names_from = disease_type, values_from = n, values_fill = 0L) |>
+    rename(MD = `Muscular Dystrophy`) |>
+    mutate(n_docs = MD + Myositis, pct_md = MD / n_docs) |>
+    filter(n_docs >= min_docs) |>
+    rowwise() |>
+    mutate(binom_p = binom.test(MD, n_docs, p = baseline_md)$p.value) |>
+    ungroup() |>
+    mutate(
+      q_value = p.adjust(binom_p, "BH"),
+      dev_pp  = round((pct_md - baseline_md) * 100, 1),
+      disease = if_else(pct_md >= baseline_md, "Muscular Dystrophy", "Myositis"),
+      sig     = q_value < 0.05,
+      baseline_md = baseline_md
+    ) |>
+    arrange(desc(pct_md))
+}
+
+term_split_table <- function(ts, scope) {
+  ts |>
+    transmute(Term = word, MD, Myositis, Posts = n_docs,
+              `% MD` = round(100 * pct_md), `Dev (pp)` = dev_pp,
+              p = signif(binom_p, 2), `adj. p` = signif(q_value, 2),
+              Sig = if_else(sig, "*", "")) |>
+    kable(caption = sprintf(
+      paste0("Diet terms by disease group — %s (baseline %.0f%% MD). Per-term binomial test vs ",
+             "baseline; p = raw binomial p-value, adj. p = Benjamini–Hochberg-adjusted; * marks adj. p < 0.05."),
+      scope, 100 * ts$baseline_md[1]))
+}
+
+plot_term_split <- function(ts, scope) {
+  baseline_md <- ts$baseline_md[1]
+  ts |>
+    mutate(word = fct_reorder(word, pct_md)) |>
+    ggplot(aes(x = pct_md, y = word, color = disease)) +
+    geom_vline(xintercept = baseline_md, linetype = "dashed", color = "grey40") +
+    geom_segment(aes(x = baseline_md, xend = pct_md, yend = word, alpha = sig), linewidth = 0.6) +
+    geom_point(aes(size = n_docs, alpha = sig)) +
+    scale_color_manual(values = disease_colors, name = NULL) +
+    scale_alpha_manual(values = c(`TRUE` = 1, `FALSE` = 0.3),
+                       labels = c(`TRUE` = "adj. p < 0.05", `FALSE` = "ns"), name = "BH-adjusted p") +
+    scale_size_continuous(range = c(2, 8), name = "Posts") +
+    scale_x_continuous(labels = scales::percent_format(), limits = c(0, 1)) +
+    guides(color = guide_legend(order = 1, override.aes = list(size = 4)),
+           alpha = guide_legend(order = 2, override.aes = list(size = 4)),
+           size  = guide_legend(order = 3)) +
+    labs(
+      title = "Diet terms by disease group: direct MD vs Myositis split",
+      subtitle = sprintf("%s — share of each term's posts that are Muscular Dystrophy (dashed = %.0f%% baseline)",
+                         scope, 100 * baseline_md),
+      x = "Share of mentions in Muscular Dystrophy posts", y = NULL,
+      caption = paste0("Point size = posts mentioning the term. Faded = not significant after BH correction.\n",
+                       "Right of the baseline = over-represented in MD; left = over-represented in Myositis.")
+    ) +
+    theme_diet +
+    theme(panel.grid.major.y = element_blank())
+}
+```
+
+### 6a. Focal set (above-average diet centrality)
+
+```{r}
+#| label: signature-terms-focal
+#| message: false
+
+term_split_focal <- term_disease_split(top_diet_docs, diet_terms_lemmatized, custom_stop_words)
+
+cat(sprintf("Focal diet posts: %d | terms (>= 10 posts): %d | baseline = %.1f%% MD | significant: %d\n",
+            nrow(top_diet_docs), nrow(term_split_focal),
+            100 * term_split_focal$baseline_md[1], sum(term_split_focal$sig)))
+term_split_table(term_split_focal, "focal diet posts (above-average diet centrality)")
+```
+
+```{r}
+#| label: plot-signature-terms-focal
+#| message: false
+#| fig-width: 9
+#| fig-height: 8.5
+
+p_term_focal <- plot_term_split(term_split_focal, "Focal diet posts")
+print(p_term_focal)
+ggsave(file.path(fig_dir, "figA1_sub_diet_terms_disease_split.png"), p_term_focal,
+       width = 9, height = 8.5, dpi = 300, bg = "white")
+```
+
+### 6b. All diet posts (higher power)
+
+```{r}
+#| label: signature-terms-full
+#| message: false
+
+term_split_full <- term_disease_split(df_diet, diet_terms_lemmatized, custom_stop_words)
+
+cat(sprintf("All diet posts: %d | terms (>= 10 posts): %d | baseline = %.1f%% MD | significant: %d\n",
+            nrow(df_diet), nrow(term_split_full),
+            100 * term_split_full$baseline_md[1], sum(term_split_full$sig)))
+term_split_table(term_split_full, "all diet posts")
+```
+
+```{r}
+#| label: plot-signature-terms-full
+#| message: false
+#| fig-width: 9
+#| fig-height: 11
+
+p_term_full <- plot_term_split(term_split_full, "All diet posts")
+print(p_term_full)
+ggsave(file.path(fig_dir, "fig3_sub_diet_terms_disease_split_all.png"), p_term_full,
+       width = 9, height = 11, dpi = 300, bg = "white")
+```
+
+### 6c. Robustness to the diet-focus cutoff
+
+The focal set is defined by a single threshold (`diet_centrality_adj > 0`, i.e. above-average diet centrality for post length). To show the disease contrast does not hinge on that particular line, the per-term split is re-run across a ladder of diet-focus definitions: all diet posts, the above-average (focal) set, the top tercile of centrality, and a purely count-based cutoff (≥ 2 distinct diet terms). For each set we report corpus size, the MD baseline, the number of significant terms, and how closely each term's MD share tracks the all-diet-posts set (correlation and sign agreement of the per-term deviation from baseline).
+
+```{r}
+#| label: cutoff-robustness
+#| message: false
+
+# Ladder of diet-focus cutoffs, all fed through the same per-term split helper
+# defined in the section-10 helpers chunk.
+tercile_cut <- quantile(df_diet$diet_centrality_adj, 2 / 3, na.rm = TRUE)
+
+cutoff_sets <- list(
+  "All diet posts"           = df_diet,
+  "Above-average (focal)"    = top_diet_docs,
+  "Top tercile centrality"   = df_diet |> filter(diet_centrality_adj >= tercile_cut),
+  ">= 2 distinct diet terms" = df_diet |> filter(n_diet_terms >= 2)
+)
+
+split_by_cutoff <- cutoff_sets |>
+  imap(\(docs, nm) term_disease_split(docs, diet_terms_lemmatized, custom_stop_words))
+
+# Reference = all diet posts; each term's deviation from baseline (dev_pp) is
+# baseline-centred, so correlating it across sets shows whether the same terms
+# lean the same way regardless of cutoff.
+ref <- split_by_cutoff[["All diet posts"]] |> select(word, dev_ref = dev_pp)
+
+robustness_tbl <- split_by_cutoff |>
+  imap(\(ts, nm) {
+    joined <- ts |> inner_join(ref, by = "word")
+    tibble(
+      Cutoff          = nm,
+      Posts           = nrow(cutoff_sets[[nm]]),
+      `Terms tested`  = nrow(ts),
+      `Baseline % MD` = round(100 * ts$baseline_md[1], 1),
+      Significant     = sum(ts$sig),
+      `r vs all-diet` = round(cor(joined$dev_pp, joined$dev_ref), 3),
+      `Sign agree %`  = round(100 * mean(sign(joined$dev_pp) == sign(joined$dev_ref)), 0)
+    )
+  }) |>
+  list_rbind()
+
+kable(robustness_tbl, caption = paste(
+  "Robustness of the disease contrast across diet-focus cutoffs.",
+  "r vs all-diet = Pearson correlation of each term's deviation-from-baseline with the",
+  "all-diet-posts set; Sign agree % = share of shared terms leaning the same disease direction."
+))
+
+readr::write_csv(robustness_tbl, file.path(fig_dir, "sub_diet_terms_cutoff_robustness.csv"))
+```

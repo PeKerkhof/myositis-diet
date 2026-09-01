@@ -1,0 +1,327 @@
+---
+title: "Subreddit Diet Pipeline — 1. Import"
+subtitle: "Import the dedicated subreddits — inflammatory myopathies (myositis + dermatomyositis) vs muscular dystrophies (muscular_dystrophy + FSHD)"
+author: "Peter Kerkhof"
+date: last-modified
+format:
+  html: default
+  pdf: default
+  docx: default
+editor: visual
+execute:
+  echo: false
+  warning: false
+editor_options:
+  chunk_output_type: inline
+always_allow_html: yes
+---
+
+## Overview
+
+Imports the Arctic Shift JSONL archives for the dedicated disease subreddits, grouped into two disease groups — inflammatory myopathies (r/myositis, r/dermatomyositis) vs muscular dystrophies (r/muscular_dystrophy, r/FSHD) — and merges them. The full history of each subreddit is kept.
+
+**A note on coverage, to be carried into the paper's limitations.** The four subreddits were not all active over the same span, and this is real community history, not a gap in the data — we verified it against a second, independent copy of Reddit (the Pushshift archive) and against the live site.
+
+- **r/dermatomyositis** is locked. Reddit marks it "restricted" and its newest submission is from 10 July 2020; after that it only collects comments on old threads. So its posts are concentrated in 2019–2020.
+- **r/Myositis** was founded in 2020 and stayed nearly empty until early 2024, then grew quickly. Most of its posts are from 2024 onwards.
+- **r/muscular_dystrophy** and **r/FSHD** run steadily across the whole period.
+
+The consequence is that the two sides of the comparison are not observed evenly over time: the muscular-dystrophy side spans the full window smoothly, while the myositis side is front-loaded (dermatomyositis) and back-loaded (r/Myositis). A same-window analysis is possible but leaves too few myositis posts to be worth it, so we keep the full history for statistical power and state this temporal imbalance plainly as a limitation. Any difference between the two groups could in part reflect *when* each community was active, not only *which* disease it represents.
+
+## 1. Setup
+
+```{r}
+#| message: false
+#| label: setup-environment
+
+rm(list = ls()[!sapply(ls(), function(x) is.function(get(x)))])
+cat("\014")
+options(scipen = 999)
+
+# Keep non-ASCII characters (>=, em-dash) intact in figures and printed output.
+# Running from a bare terminal can start R in a non-UTF-8 locale, which silently
+# turns them into "<U+2265>" in plot labels and console output. RStudio already
+# sets a UTF-8 locale, so this is only a safety net for terminal/CI runs.
+if (!isTRUE(l10n_info()[["UTF-8"]])) {
+  invisible(suppressWarnings(Sys.setlocale("LC_CTYPE", "en_US.UTF-8")))
+}
+
+library(tidyverse)
+library(jsonlite)
+library(here)
+library(arrow)
+# Two notes on packages:
+# 1. Don't also load the 'feather' package. Both it and 'arrow' provide functions with
+#    the same names (read_feather / write_feather), so whichever loads last silently
+#    wins — meaning the script's behaviour would depend on the order of these lines.
+#    'arrow' is the modern replacement, so we use it on its own.
+# 2. 'anonymizer' is used once (section 6) and is called directly as
+#    anonymizer::anonymize(), so it doesn't need loading here.
+
+source(here("config.R"))
+
+# Helper: percentage table (normally in .Rprofile)
+if (!exists("perc_table")) {
+  perc_table <- function(df, column_name) {
+    df |>
+      count(!!rlang::sym(column_name), sort = TRUE, name = "count") |>
+      mutate(
+        relative_freq_pct = (count / sum(count)) * 100,
+        cumulative_freq_pct = cumsum(relative_freq_pct),
+        across(ends_with("_pct"), ~ round(.x, 1))
+      )
+  }
+}
+```
+
+## 2. Import subreddit JSONL archives
+
+```{r}
+#| message: false
+#| label: import-subreddit-archives
+
+# Columns to retain from the JSONL archives (subset present across files)
+keep_cols <- c(
+  "subreddit", "created_utc", "author", "title", "selftext", "body",
+  "link_id", "parent_id", "id", "retrieved_on", "score", "url"
+)
+
+folder_path_myo <- file.path(REDDIT_DATA_PATH, "subreddits/data/myositis")
+folder_path_mud <- file.path(REDDIT_DATA_PATH, "subreddits/data/muscular_dystrophy")
+
+files <- c(
+  list.files(folder_path_myo, pattern = "\\.jsonl$", full.names = TRUE,
+             recursive = TRUE, ignore.case = TRUE),
+  list.files(folder_path_mud, pattern = "\\.jsonl$", full.names = TRUE,
+             recursive = TRUE, ignore.case = TRUE)
+)
+
+read_jsonl <- function(file_path) {
+  con <- file(file_path, open = "r")
+  tryCatch(
+    stream_in(con, verbose = FALSE),
+    error = function(e) {
+      message(sprintf("Error reading %s: %s", file_path, e$message))
+      NULL
+    },
+    finally = if (isOpen(con)) close(con)
+  )
+}
+
+# Clean and standardize columns inside map() before combining files.
+# This prevents two common issues:
+# 1. Inconsistent data types: Some files have extra columns or different formats 
+#    (e.g., lists vs. empty NAs) that cause errors when combined. Limiting to 
+#    'keep_cols' and forcing all fields to text (character) standardizes them first.
+# 2. Memory crashes: Processing files one-by-one keeps only the small, cleaned 
+#    data in memory. Reading all massive raw files first would crash R.
+
+df_raw <- files |>
+  map(\(f) {
+    d <- read_jsonl(f)
+    if (is.null(d) || nrow(d) == 0) return(NULL)
+    d |>
+      select(any_of(keep_cols)) |>
+      mutate(across(everything(), as.character))
+  }) |>
+  list_rbind()
+
+cat("Raw posts read from JSONL:", scales::comma(nrow(df_raw)), "\n")
+
+# Throw out anything we've read twice.
+# We read whole folders, so if the same archive file sits in two places — easily done
+# when you re-download one and drop the copy somewhere else — every post in it would
+# otherwise be counted twice, and the subreddit would silently look twice as busy as
+# it is. Every Reddit post has its own id, so a repeated id means a repeated post.
+# We match on the id AND the timestamp: ids are only guaranteed unique within their
+# own kind, so in principle a comment and a submission could carry the same one, and
+# they would never share a posting time.
+n_before <- nrow(df_raw)
+df_raw <- df_raw |> distinct(id, created_utc, .keep_all = TRUE)
+if (n_before > nrow(df_raw)) {
+  cat("Dropped", scales::comma(n_before - nrow(df_raw)),
+      "duplicate posts (the same archive file read more than once)\n")
+}
+
+cat("Unique posts:", scales::comma(nrow(df_raw)), "\n\n")
+perc_table(df_raw, "subreddit")
+```
+
+## 3. Group the four dedicated subreddits
+
+```{r}
+#| message: false
+#| label: select-subreddits
+
+# Constructs a Myositis column = general myositis + the
+# inflammatory-myopathy subtype dermatomyositis; and an MD column = general
+# muscular dystrophy + FSHD (a specific muscular dystrophy).
+
+myositis_subs <- c("Myositis", "dermatomyositis")
+md_subs       <- c("MuscularDystrophy", "FSHD")
+target_subs   <- c(myositis_subs, md_subs)
+
+df <- df_raw |>
+  filter(subreddit %in% target_subs) |>
+  mutate(disease_type = if_else(subreddit %in% md_subs,
+                                "Muscular Dystrophy", "Myositis"))
+
+cat("Posts in the four dedicated subreddits:", scales::comma(nrow(df)),
+    "| dropped by the allow-list:", scales::comma(nrow(df_raw) - nrow(df)), "\n\n")
+print(df |> count(subreddit, disease_type, sort = TRUE))
+```
+
+## 4. Temporal parsing and filter
+
+```{r}
+#| message: false
+#| label: temporal
+
+# Keep the full history. Everything BEFORE this date is kept, so the corpus ends on
+# the day before (14 July 2026).
+
+cut_off_date <- "2026-07-15"
+
+df <- df |>
+  mutate(
+    created_utc  = as.POSIXct(as.numeric(created_utc),  origin = "1970-01-01", tz = "UTC"),
+    retrieved_on = as.POSIXct(as.numeric(retrieved_on), origin = "1970-01-01", tz = "UTC"),
+    date     = date(created_utc),
+    year     = year(created_utc),
+    month    = month(created_utc),
+    month_yr = format_ISO8601(created_utc, precision = "ym"),
+    week_number = isoweek(date)
+  ) |>
+  arrange(created_utc) |>
+  filter(date < as.Date(cut_off_date))
+
+cat("Date range:", format(min(df$date)), "to", format(max(df$date)), "\n\n")
+
+# Coverage by subreddit and year. This is the table behind the limitation noted at
+# the top: dermatomyositis stops in 2020 (locked), r/Myositis only fills in from 2024,
+# while the two dystrophy subreddits run throughout. Print it so the imbalance is
+# visible in the rendered document, not just asserted in prose.
+cat("Posts per subreddit per year (documents the temporal imbalance):\n")
+print(df |> count(subreddit, year) |>
+        pivot_wider(names_from = subreddit, values_from = n, values_fill = 0L) |>
+        arrange(year), n = 30)
+```
+
+## 5. Text preprocessing
+
+```{r}
+#| message: false
+#| label: preprocess-text
+
+# Merge title + selftext + body into one lowercase text field with proper punctuation handling.
+
+df <- df |>
+  mutate(
+    selftext = str_trim(selftext),
+    title    = str_trim(title),
+    body     = str_trim(body),
+    title_punctuated = str_detect(title, "[\\.\\?\\!\\:]$"),
+    title_clean = case_when(
+      is.na(title) | title == "" ~ "",
+      title_punctuated ~ paste0(title, " "),
+      TRUE ~ paste0(title, ". ")
+    ),
+    text = paste0(title_clean, coalesce(selftext, ""), coalesce(body, "")),
+    text = tolower(text),
+    text = str_replace_all(text, "[-_]", " ")
+  ) |>
+  select(-title_punctuated, -title_clean) |>
+  select(disease_type, subreddit, created_utc, text, everything())
+```
+
+## 6. Post URLs, anonymization, text metrics
+
+```{r}
+#| message: false
+#| label: urls-metrics-anon
+
+df <- df |>
+  mutate(
+    post_url = paste0("https://www.reddit.com/comments/", id),
+    n_words  = str_count(text, "\\w+")
+  )
+
+# Anonymize author names using CRC32 hashing.
+# # How it works:
+# 1. Stable & Reproducible: Using a fixed seed (.seed = 0) ensures that the same 
+#    username always gets the exact same anonymous ID every time this script runs.
+# 2. Deleted Users: Users listed as "[deleted]" will also get a random-looking hash, 
+#    but we manually change that back to a readable label later in the script.
+
+df$author_ano <- anonymizer::anonymize(
+  df$author, .algo = "crc32", .seed = 0)
+  
+df <- df |>
+  mutate(author_ano = str_replace(author_ano, "3c0a4086", "deleted"))
+
+```
+
+## 7. Classify post types as submissions and comments
+
+```{r}
+#| message: false
+#| label: classify-post-types
+
+# Work out where each post sits in a conversation. Reddit threads have three levels:
+#   submission          - someone starts a thread ("I was just diagnosed with DM...")
+#   comment             - a reply to that thread starter
+#   comment_to_comment  - a reply to someone else's reply
+#
+# How to tell them apart: every post records its "parent" (what it replies to), and
+# Reddit labels IDs with a two-letter prefix — t3_ means the parent is a thread
+# starter, t1_ means the parent is another comment. So:
+#   no parent at all -> it IS the thread starter (a submission)
+#   parent is t3_    -> a comment
+#   parent is t1_    -> a reply to a reply
+#
+# Note that the archives sometimes store the parent ID without its prefix. When
+# that happens we work it out by comparing with link_id, which always holds the ID of
+# the thread the post belongs to. If the bare parent ID matches the thread ID, the
+# post is replying to the thread starter (t3_); otherwise it is replying to a
+# comment (t1_).
+
+df <- df |>
+  mutate(
+    parent_id_chr = str_trim(coalesce(as.character(parent_id), "")),
+    link_id_chr   = str_trim(coalesce(as.character(link_id), "")),
+    parent_fullname = case_when(
+      parent_id_chr == "" ~ NA_character_,
+      str_starts(parent_id_chr, "t1_") | str_starts(parent_id_chr, "t3_") ~ parent_id_chr,
+      parent_id_chr == str_remove(link_id_chr, "^t3_") ~ str_c("t3_", parent_id_chr),
+      TRUE ~ str_c("t1_", parent_id_chr)
+    ),
+    post_type = case_when(
+      is.na(parent_fullname) | parent_fullname == "" ~ "submission",
+      str_starts(parent_fullname, "t3_") ~ "comment",
+      str_starts(parent_fullname, "t1_") ~ "comment_to_comment",
+      TRUE ~ "unknown"
+    )
+  ) |>
+  select(-parent_id_chr, -link_id_chr)
+
+print(df |> count(post_type, sort = TRUE) |>
+        mutate(pct = scales::percent(n / sum(n), accuracy = 0.1)))
+```
+
+## 8. Save output
+
+```{r}
+#| message: false
+#| label: save-output
+
+output_path <- file.path(DATA_PATH, "data/myo_dys_subreddits_2005_jul2026.feather")
+write_feather(df, output_path)
+message(sprintf("Saved %s rows to: %s", scales::comma(nrow(df)), output_path))
+```
+
+## Output summary
+
+- **Total posts**: `r scales::comma(nrow(df))`
+- **Date range**: `r min(df$date)` to `r max(df$date)`
+- **Subreddits**: r/myositis, r/dermatomyositis (Myositis group) vs r/muscular_dystrophy, r/FSHD (MD group)
+- **Output**: DATA_PATH/data/`r basename(output_path)`
